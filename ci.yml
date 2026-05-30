@@ -1,0 +1,127 @@
+name: Django CI/CD with Selenium
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+
+    services:
+      selenium:
+        image: selenium/standalone-chrome:latest
+        ports:
+          - 4444:4444
+        options: --shm-size=2g
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run DB migrations (Local for tests)
+        run: |
+          python manage.py makemigrations
+          python manage.py migrate
+
+      - name: Start Django app (for test only)
+        run: |
+          nohup python manage.py runserver 0.0.0.0:8000 > devserver.log 2>&1 &
+          sleep 10
+
+      - name: Run Selenium Tests
+        run: pytest tests/ --maxfail=1 --disable-warnings --html=tests/report.html
+
+      - name: Upload HTML Test Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: selenium-test-report
+          path: tests/report.html
+
+      - name: Deploy to EC2 if tests pass
+        if: success()
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+
+          script_before: |
+            mkdir -p ~/.ssh
+            chmod 700 ~/.ssh
+            echo "${{ secrets.SSH_DEPLOY_KEY_GITHUB }}" | tee ~/.ssh/id_rsa_github_deploy > /dev/null
+            chmod 600 ~/.ssh/id_rsa_github_deploy
+            ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+            chmod 644 ~/.ssh/known_hosts
+            echo "Host github.com" > ~/.ssh/config
+            echo "  IdentityFile ~/.ssh/id_rsa_github_deploy" >> ~/.ssh/config
+            echo "  StrictHostKeyChecking no" >> ~/.ssh/config
+            chmod 600 ~/.ssh/config
+
+          script: |
+            sudo yum install -y git
+            cd ~
+            if [ ! -d selenium_cicd2 ]; then
+              git clone git@github.com:venkat2356/selenium_cicd2.git
+            fi
+            cd selenium_cicd2
+
+            echo "Pulling latest code..."
+            git reset --hard
+            git clean -fd
+            git pull origin master
+
+            echo "Removing Python cache..."
+            find . -type d -name "__pycache__" -exec rm -rf {} +
+            find . -name "*.pyc" -delete
+
+            echo "Rebuilding virtual environment..."
+            python3 -m venv venv
+            source venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt
+
+            echo "Applying DB migrations..."
+            python manage.py migrate
+
+            echo "Collecting static files..."
+            python manage.py collectstatic --noinput
+
+            echo "Setting up Gunicorn as a service..."
+            echo "[Unit]
+            Description=Gunicorn daemon for Django app
+            After=network.target
+
+            [Service]
+            User=ec2-user
+            Group=nginx
+            WorkingDirectory=/home/ec2-user/selenium_cicd2
+            ExecStart=/home/ec2-user/selenium_cicd2/venv/bin/gunicorn --workers 3 --bind 127.0.0.1:8000 expense_tracker.wsgi:application
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target" | sudo tee /etc/systemd/system/gunicorn.service > /dev/null
+
+            sudo systemctl daemon-reexec
+            sudo systemctl daemon-reload
+            sudo systemctl enable gunicorn
+            sudo systemctl restart gunicorn
+            sudo systemctl status gunicorn --no-pager
+
+            echo "Restarting Nginx..."
+            sudo nginx -t
+            sudo systemctl restart nginx
+
+            echo "Deployment complete."
